@@ -4,6 +4,7 @@ import torch
 COMPONENTS_6 = ((0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (0, 2))
 IN_PLANE_COMPONENTS = ((0, 0), (1, 1), (0, 1))
 MODEL_COMPONENT_NAMES = ("xx", "yy", "xy")
+INPLANE_IRREP_COMPONENT_NAMES = ("trace", "anisotropy", "shear")
 RAW_COMPONENT_NAMES = ("xx", "yy", "zz", "xy", "yz", "xz")
 SYMMETRIC_PAIRS = {
     (0, 1): (1, 0),
@@ -41,6 +42,51 @@ def inplane_components_to_tensor(components):
     tensor[..., 0, 1] = components[..., 2]
     tensor[..., 1, 0] = components[..., 2]
     return tensor
+
+
+def inplane_components_to_irreps(components):
+    sqrt2 = torch.sqrt(components.new_tensor(2.0))
+    xx = components[..., 0]
+    yy = components[..., 1]
+    xy = components[..., 2]
+    return torch.stack(
+        [
+            (xx + yy) / sqrt2,
+            (xx - yy) / sqrt2,
+            sqrt2 * xy,
+        ],
+        dim=-1,
+    )
+
+
+def inplane_irreps_to_components(irreps):
+    sqrt2 = torch.sqrt(irreps.new_tensor(2.0))
+    trace = irreps[..., 0]
+    anisotropy = irreps[..., 1]
+    shear = irreps[..., 2]
+    return torch.stack(
+        [
+            (trace + anisotropy) / sqrt2,
+            (trace - anisotropy) / sqrt2,
+            shear / sqrt2,
+        ],
+        dim=-1,
+    )
+
+
+def tensor_to_inplane_irreps(tensor):
+    return inplane_components_to_irreps(tensor_to_inplane_components(tensor))
+
+
+def inplane_irreps_to_tensor(irreps):
+    return inplane_components_to_tensor(inplane_irreps_to_components(irreps))
+
+
+def mask_to_inplane_irrep_mask(mask):
+    component_mask = tensor_to_inplane_components(mask) > 0.5
+    diagonal_valid = component_mask[..., 0] & component_mask[..., 1]
+    shear_valid = component_mask[..., 2]
+    return torch.stack([diagonal_valid, diagonal_valid, shear_valid], dim=-1)
 
 
 def project_tensor_to_inplane(tensor):
