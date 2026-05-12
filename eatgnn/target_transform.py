@@ -1,9 +1,10 @@
-import math
-
 import torch
 
 
 COMPONENTS_6 = ((0, 0), (1, 1), (2, 2), (0, 1), (1, 2), (0, 2))
+IN_PLANE_COMPONENTS = ((0, 0), (1, 1), (0, 1))
+MODEL_COMPONENT_NAMES = ("xx", "yy", "xy")
+RAW_COMPONENT_NAMES = ("xx", "yy", "zz", "xy", "yz", "xz")
 SYMMETRIC_PAIRS = {
     (0, 1): (1, 0),
     (1, 2): (2, 1),
@@ -27,6 +28,33 @@ def symmetric_components_to_tensor(components):
     return tensor
 
 
+def tensor_to_inplane_components(tensor):
+    sym = 0.5 * (tensor + tensor.transpose(-1, -2))
+    return torch.stack([sym[..., i, j] for i, j in IN_PLANE_COMPONENTS], dim=-1)
+
+
+def inplane_components_to_tensor(components):
+    shape = components.shape[:-1] + (3, 3)
+    tensor = components.new_zeros(shape)
+    tensor[..., 0, 0] = components[..., 0]
+    tensor[..., 1, 1] = components[..., 1]
+    tensor[..., 0, 1] = components[..., 2]
+    tensor[..., 1, 0] = components[..., 2]
+    return tensor
+
+
+def project_tensor_to_inplane(tensor):
+    return inplane_components_to_tensor(tensor_to_inplane_components(tensor))
+
+
+def raw_tensor_to_model_tensor(tensor):
+    return project_tensor_to_inplane(tensor)
+
+
+def model_tensor_to_raw_tensor(tensor):
+    return project_tensor_to_inplane(tensor)
+
+
 def mask_to_symmetric_component_mask(mask):
     valid = mask > 0.5
     masks = []
@@ -37,6 +65,14 @@ def mask_to_symmetric_component_mask(mask):
         else:
             masks.append(valid[..., i, j])
     return torch.stack(masks, dim=-1)
+
+
+def raw_mask_to_model_mask(mask):
+    valid = mask > 0.5
+    m_xx, m_yy = valid[..., 0, 0], valid[..., 1, 1]
+    m_xy = valid[..., 0, 1] & valid[..., 1, 0]
+    model_mask_components = torch.stack([m_xx, m_yy, m_xy], dim=-1)
+    return inplane_components_to_tensor(model_mask_components.to(mask.dtype))
 
 
 def symmetric_component_mask_to_tensor(mask_components):
@@ -59,9 +95,9 @@ class SymmetricTensorTargetTransform:
     def __init__(self, method="signed_log1p_robust", eps=1e-6):
         self.method = method
         self.eps = eps
-        self.tail_scale = torch.ones(6, dtype=torch.float32)
-        self.center = torch.zeros(6, dtype=torch.float32)
-        self.scale = torch.ones(6, dtype=torch.float32)
+        self.tail_scale = torch.ones(3, dtype=torch.float32)
+        self.center = torch.zeros(3, dtype=torch.float32)
+        self.scale = torch.ones(3, dtype=torch.float32)
         self.fitted = False
 
     def fit(self, dataset):
@@ -73,16 +109,16 @@ class SymmetricTensorTargetTransform:
             if target.ndim == 2:
                 target = target.unsqueeze(0)
                 mask = mask.unsqueeze(0)
-            components.append(tensor_to_symmetric_components(target).detach().cpu())
+            components.append(tensor_to_inplane_components(target).detach().cpu())
             masks.append(mask_to_symmetric_component_mask(mask).detach().cpu())
 
         components = torch.cat(components, dim=0).float()
-        masks = torch.cat(masks, dim=0) > 0.5
+        masks = torch.cat(masks, dim=0)[..., [0, 1, 3]] > 0.5
 
-        tail_scale = torch.ones(6, dtype=torch.float32)
-        center = torch.zeros(6, dtype=torch.float32)
-        scale = torch.ones(6, dtype=torch.float32)
-        for idx in range(6):
+        tail_scale = torch.ones(3, dtype=torch.float32)
+        center = torch.zeros(3, dtype=torch.float32)
+        scale = torch.ones(3, dtype=torch.float32)
+        for idx in range(3):
             vals = components[..., idx][masks[..., idx]]
             if vals.numel() == 0:
                 continue
@@ -118,22 +154,22 @@ class SymmetricTensorTargetTransform:
         raise ValueError(f"Unsupported target transform method: {self.method}")
 
     def transform_tensor(self, tensor):
-        components = tensor_to_symmetric_components(tensor)
+        components = tensor_to_inplane_components(tensor)
         tail_scale = self.tail_scale.to(device=tensor.device, dtype=tensor.dtype)
         center = self.center.to(device=tensor.device, dtype=tensor.dtype)
         scale = self.scale.to(device=tensor.device, dtype=tensor.dtype)
         transformed = self._tail_transform(components, tail_scale)
         transformed = (transformed - center) / scale
-        return symmetric_components_to_tensor(transformed)
+        return inplane_components_to_tensor(transformed)
 
     def inverse_tensor(self, tensor):
-        components = tensor_to_symmetric_components(tensor)
+        components = tensor_to_inplane_components(tensor)
         tail_scale = self.tail_scale.to(device=tensor.device, dtype=tensor.dtype)
         center = self.center.to(device=tensor.device, dtype=tensor.dtype)
         scale = self.scale.to(device=tensor.device, dtype=tensor.dtype)
         original = components * scale + center
         original = self._inverse_tail_transform(original, tail_scale)
-        return symmetric_components_to_tensor(original)
+        return inplane_components_to_tensor(original)
 
     def state_dict(self):
         return {
@@ -142,13 +178,14 @@ class SymmetricTensorTargetTransform:
             "tail_scale": self.tail_scale.tolist(),
             "center": self.center.tolist(),
             "scale": self.scale.tolist(),
-            "components": ["xx", "yy", "zz", "xy", "yz", "xz"],
+            "components": list(MODEL_COMPONENT_NAMES),
         }
 
 
 def apply_target_transform(dataset, transform):
     for sample in dataset:
-        sample.energy_raw = sample.energy.clone()
+        if not hasattr(sample, "energy_model_raw"):
+            sample.energy_model_raw = sample.energy.clone()
         sample.energy = transform.transform_tensor(sample.energy)
     return dataset
 

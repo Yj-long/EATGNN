@@ -12,10 +12,24 @@
   "extra_atom_descriptor_key": "element",
   "extra_atom_descriptor_columns": null,
   "extra_atom_descriptor_missing_value": 0.0,
-  "global_descriptor_path": "eatgnn_aux_physical_priors.csv",
+  "global_descriptor_path": [
+  "eatgnn_aux_physical_priors.csv",
+  "stage1_oof_tail_hints.csv"
+   ],
   "global_descriptor_uid_key": "uid",
-  "global_descriptor_columns": null,
+  "global_descriptor_columns": [
+    null,
+    [
+      "hint_p_tail_class_raw",
+      "hint_p_tail_binary_raw",
+      "hint_p_tail_binary_calibrated",
+      "hint_z_tail_pred",
+      "hint_tail_score_fused",
+      "hint_c_pred"
+    ]
+  ],
   "global_descriptor_missing_value": 0.0,
+  "use_global_descriptor_gating": true,
   "target_transform": {
     "enabled": true,
     "method": "signed_log1p_robust",
@@ -31,6 +45,7 @@
   "test_ratio": 0.1,
   "radial_cutoff": 5,
   "max_radius": 7,
+  "use_attention": true,
   "heads": 2,
   "lmax": 3,
   "embedding_dim": 64,
@@ -43,10 +58,26 @@
   "number_of_basis": 10,
   "pool_nodes": true,
   "lr": 0.005,
+  "weight_decay": 0.01,
+  "gradient_clip_max_norm": 1.0,
+  "uvu_dropout_p": 0.2,
   "lr_scheduler_mode": "min",
   "lr_scheduler_factor": 0.5,
-  "lr_scheduler_patience": 8,
+  "lr_scheduler_patience": 2,
   "lr_scheduler_min_lr": 0.000001,
-  "loss_type": "weighted_masked_huber_s_q",
+  "loss_type": "tensor_basis_huber_frobenius",
+  "loss_component_weights": {
+    "xx": 1.0,
+    "yy": 1.0,
+    "xy": 1.0
+  },
+  "lambda_tensor": 0.0,
+  "best_model_metric": "diag_score",
+  "diag_score_weights": {
+    "xx": 1,
+    "yy": 1,
+    "xy": 1
+  },
+  "diag_score_normalization": "train_mae_scale",
   "loss_ws": 1.0
 }

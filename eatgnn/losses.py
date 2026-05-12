@@ -1,7 +1,10 @@
-import math
-
 import torch
 import torch.nn.functional as F
+
+from .target_transform import (
+    MODEL_COMPONENT_NAMES,
+    tensor_to_inplane_components,
+)
 
 
 def count_parameters(model):
@@ -16,182 +19,80 @@ def evaluate_tensor_metrics(pred, target):
     return mae, rmse, max_abs
 
 
-def tensor_to_scalar_q_components(tensor_3x3: torch.Tensor):
-    """Decompose a (possibly batched) 3x3 tensor into scalar s and five q components."""
-    sym = 0.5 * (tensor_3x3 + tensor_3x3.transpose(-1, -2))
-    xx, yy, zz = sym[..., 0, 0], sym[..., 1, 1], sym[..., 2, 2]
-    xy, yz, xz = sym[..., 0, 1], sym[..., 1, 2], sym[..., 0, 2]
-
-    s = (xx + yy + zz) / 3.0
-    q1 = 0.5 * (xx - yy)
-    q2 = (2.0 * zz - xx - yy) / (2.0 * math.sqrt(3.0))
-    q3 = xy
-    q4 = yz
-    q5 = xz
-    q = torch.stack([q1, q2, q3, q4, q5], dim=-1)
-    return s, q
+def _component_delta(delta, idx, device, dtype):
+    if isinstance(delta, dict):
+        return float(delta.get(MODEL_COMPONENT_NAMES[idx], 1.0))
+    if isinstance(delta, (list, tuple)):
+        return float(delta[idx])
+    if torch.is_tensor(delta):
+        delta = delta.to(device=device, dtype=dtype)
+        if delta.numel() == 1:
+            return float(delta.item())
+        return float(delta[idx].item())
+    return float(delta)
 
 
-def mask_to_component_mask(mask_3x3: torch.Tensor):
-    """Map element-wise 3x3 supervision mask to [s, q1..q5] supervision masks."""
-    valid = mask_3x3 > 0.5
-    m_xx, m_yy, m_zz = valid[..., 0, 0], valid[..., 1, 1], valid[..., 2, 2]
-    m_xy = valid[..., 0, 1] & valid[..., 1, 0]
-    m_yz = valid[..., 1, 2] & valid[..., 2, 1]
-    m_xz = valid[..., 0, 2] & valid[..., 2, 0]
-
-    # s, q1, q2 all depend on the three diagonal terms
-    m_diag = m_xx & m_yy & m_zz
-    m_s = m_diag
-    m_q = torch.stack([m_diag, m_diag, m_xy, m_yz, m_xz], dim=-1)
-    return m_s, m_q
-
-
-def weighted_masked_huber_loss(
+def tensor_basis_huber_frobenius_loss(
     pred,
     target,
     mask,
-    ws: float = 1.0,
-    wq = (1.0, 1.0, 1.0, 1.0, 1.0),
-    delta = 1.0,
+    component_weights=None,
+    delta=1.0,
+    lambda_tensor=0.0,
 ):
-    pred_s, pred_q = tensor_to_scalar_q_components(pred)
-    target_s, target_q = tensor_to_scalar_q_components(target)
-    m_s, m_q = mask_to_component_mask(mask)
+    if component_weights is None:
+        component_weights = {name: 1.0 for name in MODEL_COMPONENT_NAMES}
 
-    if isinstance(delta, (list, tuple)):
-        delta = torch.tensor(delta, dtype=pred.dtype, device=pred.device)
-    elif torch.is_tensor(delta):
-        delta = delta.to(device=pred.device, dtype=pred.dtype)
-
-    if torch.is_tensor(delta) and delta.numel() == 3:
-        delta_xx, delta_yy, delta_zz = delta[0], delta[1], delta[2]
-        delta_s = float(((delta_xx + delta_yy + delta_zz) / 3.0).item())
-        delta_q1 = float(((delta_xx + delta_yy) / 2.0).item())
-        delta_q2 = float(((delta_xx + delta_yy + delta_zz) / 3.0).item())
-        delta_q3 = float(((delta_xx + delta_yy + delta_zz) / 3.0).item())
-        delta_q4 = float(((delta_xx + delta_yy + delta_zz) / 3.0).item())
-        delta_q5 = float(((delta_xx + delta_yy + delta_zz) / 3.0).item())
-        q_deltas = [delta_q1, delta_q2, delta_q3, delta_q4, delta_q5]
-    else:
-        delta_s = float(delta)
-        q_deltas = [float(delta)] * 5
+    pred_components = tensor_to_inplane_components(pred)
+    target_components = tensor_to_inplane_components(target)
+    component_mask = tensor_to_inplane_components(mask)
 
     total_loss = pred.sum() * 0.0
-    total_weight = 0.0
-
-    if m_s.any():
-        l_s = F.huber_loss(pred_s[m_s], target_s[m_s], reduction="mean", delta=delta_s)
-        total_loss = total_loss + ws * l_s
-        total_weight += ws
-
-    for k in range(5):
-        mk = m_q[..., k]
-        wk = float(wq[k])
-        if mk.any():
-            l_qk = F.huber_loss(
-                pred_q[..., k][mk],
-                target_q[..., k][mk],
+    for idx, name in enumerate(MODEL_COMPONENT_NAMES):
+        valid = component_mask[..., idx] > 0.5
+        weight = float(component_weights.get(name, 1.0))
+        if valid.any() and weight != 0.0:
+            total_loss = total_loss + weight * F.huber_loss(
+                pred_components[..., idx][valid],
+                target_components[..., idx][valid],
                 reduction="mean",
-                delta=q_deltas[k],
+                delta=_component_delta(delta, idx, pred.device, pred.dtype),
             )
-            total_loss = total_loss + wk * l_qk
-            total_weight += wk
 
-    if total_weight == 0.0:
-        return total_loss
-    return total_loss / total_weight
+    if float(lambda_tensor) != 0.0:
+        tensor_valid = (component_mask > 0.5).all(dim=-1)
+        if tensor_valid.any():
+            pred_2x2 = pred[..., :2, :2][tensor_valid]
+            target_2x2 = target[..., :2, :2][tensor_valid]
+            frob = torch.linalg.matrix_norm(pred_2x2 - target_2x2, ord="fro", dim=(-2, -1))
+            total_loss = total_loss + float(lambda_tensor) * frob.mean()
+
+    return total_loss
 
 
-def estimate_loss_hparams_from_trainset(train_dataset):
-    """
-    Estimate loss_wq and huber_delta from supervised targets in the training set.
-    - loss_wq: inverse per-component scale (normalized to mean=1 on observed components)
-    - huber_delta: robust global scale estimated from supervised [s, q1..q5]
-    """
-    q_values = [[] for _ in range(5)]
-    sq_values = []
-
+def estimate_model_component_huber_delta_from_trainset(train_dataset):
+    values = [[] for _ in range(3)]
     for sample in train_dataset:
         target = sample.energy
         mask = sample.energy_mask
         if target.ndim == 2:
             target = target.unsqueeze(0)
             mask = mask.unsqueeze(0)
-
-        s, q = tensor_to_scalar_q_components(target)
-        m_s, m_q = mask_to_component_mask(mask)
-
-        if m_s.any():
-            s_vals = s[m_s].detach().cpu()
-            sq_values.append(s_vals)
-
-        for k in range(5):
-            mk = m_q[..., k]
-            if mk.any():
-                qk_vals = q[..., k][mk].detach().cpu()
-                q_values[k].append(qk_vals)
-                sq_values.append(qk_vals)
-
-    wq = torch.ones(5, dtype=torch.float32)
-    observed = []
-    for k in range(5):
-        if len(q_values[k]) == 0:
-            wq[k] = 0.0
-            continue
-        vals = torch.cat(q_values[k], dim=0).float()
-        scale = vals.std(unbiased=False).clamp_min(1e-6)
-        wq[k] = 1.0 / scale
-        observed.append(k)
-
-    if len(observed) > 0:
-        wq_mean = wq[observed].mean().clamp_min(1e-6)
-        wq[observed] = wq[observed] / wq_mean
-
-    if len(sq_values) == 0:
-        huber_delta = 1.0
-    else:
-        all_vals = torch.cat(sq_values, dim=0).float()
-        med = all_vals.median()
-        mad = (all_vals - med).abs().median().clamp_min(1e-6)
-        robust_sigma = 1.4826 * mad
-        huber_delta = float((1.345 * robust_sigma).item())
-        huber_delta = max(huber_delta, 1e-3)
-
-    return wq.tolist(), huber_delta
-
-
-def estimate_diag_huber_delta_from_trainset(train_dataset):
-    """
-    Estimate per-diagonal huber deltas [delta_xx, delta_yy, delta_zz] from supervised
-    diagonal entries only. Formula is unchanged:
-      robust_sigma = 1.4826 * MAD
-      delta = max(1.345 * robust_sigma, 1e-3)
-    """
-    diag_values = [[] for _ in range(3)]
-
-    for sample in train_dataset:
-        target = sample.energy
-        mask = sample.energy_mask
-        if target.ndim == 2:
-            target = target.unsqueeze(0)
-            mask = mask.unsqueeze(0)
-
-        valid = mask > 0.5
-        for i in range(3):
-            mi = valid[..., i, i]
-            if mi.any():
-                vals = target[..., i, i][mi].detach().cpu().float()
-                diag_values[i].append(vals)
+        components = tensor_to_inplane_components(target)
+        component_mask = tensor_to_inplane_components(mask)
+        for idx in range(3):
+            valid = component_mask[..., idx] > 0.5
+            if valid.any():
+                values[idx].append(components[..., idx][valid].detach().cpu().float())
 
     deltas = []
-    for i in range(3):
-        if len(diag_values[i]) == 0:
+    for idx in range(3):
+        if not values[idx]:
             deltas.append(1.0)
             continue
-        all_vals = torch.cat(diag_values[i], dim=0)
-        med = all_vals.median()
-        mad = (all_vals - med).abs().median().clamp_min(1e-6)
+        vals = torch.cat(values[idx], dim=0)
+        med = vals.median()
+        mad = (vals - med).abs().median().clamp_min(1e-6)
         robust_sigma = 1.4826 * mad
         delta_i = float((1.345 * robust_sigma).item())
         deltas.append(max(delta_i, 1e-3))

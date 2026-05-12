@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Union
+from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +13,8 @@ from e3nn.util.jit import compile_mode
 from pymatgen.core.tensors import Tensor
 from torch_geometric.data import Data
 from torch_scatter import scatter
+
+from .target_transform import project_tensor_to_inplane
 
 heads = 2
 lmax = 3
@@ -292,6 +294,7 @@ class UVUTensorProduct(torch.nn.Module):
         irreps_out: o3.Irreps,
         node_attr:o3.Irreps,
         internal_and_share_weights: bool = False,
+        dropout_p: float = 0.2,
         # mlp_input_size: int = None,
         # mlp_hidden_size: int = 8,
         # mlp_num_hidden_layers: int = 1,
@@ -353,7 +356,7 @@ class UVUTensorProduct(torch.nn.Module):
             internal_weights=internal_and_share_weights,
             shared_weights=internal_and_share_weights,
         )
-        self.dropout2 = nn.Dropout(irreps=self.irreps_mid, p=0.2)
+        self.dropout2 = nn.Dropout(irreps=self.irreps_mid, p=float(dropout_p))
         # self.lin=o3.Linear(irreps_in=self.irreps_mid,irreps_out=self.out)
         self.lin=o3.FullyConnectedTensorProduct(self.irreps_mid, self.node_attr,self.out)
 
@@ -447,7 +450,16 @@ def stable_softmax(x):
     return F.softmax(shiftx,dim=-1)
 @compile_mode('script')
 class Attention(torch.nn.Module):
-    def __init__(self, node_attr,irreps_node_input, irreps_query, irreps_key, irreps_output, number_of_basis):
+    def __init__(
+        self,
+        node_attr,
+        irreps_node_input,
+        irreps_query,
+        irreps_key,
+        irreps_output,
+        number_of_basis,
+        dropout_p=0.2,
+    ):
         super().__init__()
         # self.radial_cutoff = radial_cutoff
         self.heads=heads
@@ -470,12 +482,16 @@ class Attention(torch.nn.Module):
         self.irreps_output=o3.Irreps(irreps_output)
 
 
-        self.tp_k=UVUTensorProduct(self.irreps_node_input, self.irreps_sh, self.irreps_key,self.node_attr)
+        self.tp_k=UVUTensorProduct(
+            self.irreps_node_input, self.irreps_sh, self.irreps_key, self.node_attr, dropout_p=dropout_p
+        )
         # self.dropout1=nn.Dropout(irreps=self.irreps_node_input,p=0.2)
         self.fc_k = FullyConnectedNet(self.number_of_basis+ [self.tp_k.tp.weight_numel], act=torch.nn.functional.silu)
 
 
-        self.tp_v=UVUTensorProduct(self.irreps_node_input, self.irreps_sh, self.irreps_output,self.node_attr)
+        self.tp_v=UVUTensorProduct(
+            self.irreps_node_input, self.irreps_sh, self.irreps_output, self.node_attr, dropout_p=dropout_p
+        )
         # self.dropout2=nn.Dropout(irreps=self.irreps_output,p=0.2)
         self.fc_v= FullyConnectedNet(self.number_of_basis+ [self.tp_v.tp.weight_numel], act=torch.nn.functional.silu)
 
@@ -567,6 +583,7 @@ class EquivariantAttention(torch.nn.Module):
         irreps_edge_attr,
         layers,
         fc_neurons,
+        dropout_p=0.2,
 
     ) -> None:
         super().__init__()
@@ -627,13 +644,15 @@ class EquivariantAttention(torch.nn.Module):
             )
 
             conv = Attention(self.attr,
-                self.irreps_node_input,  self.irreps_query,self.irreps_key, gate.irreps_in, fc_neurons
+                self.irreps_node_input,  self.irreps_query,self.irreps_key, gate.irreps_in, fc_neurons,
+                dropout_p=dropout_p,
             )
             self.irreps_node_input = gate.irreps_out
             self.norm=EquivariantLayerNormFast(self.irreps_node_input)
             self.layers.append(Compose(Compose(conv, gate),self.norm))
         self.layers.append(Attention(self.attr,
-                self.irreps_node_input, self.irreps_query, self.irreps_key, self.irreps_node_output, fc_neurons
+                self.irreps_node_input, self.irreps_query, self.irreps_key, self.irreps_node_output, fc_neurons,
+                dropout_p=dropout_p,
             )
         )
 
@@ -642,6 +661,60 @@ class EquivariantAttention(torch.nn.Module):
         for lay in self.layers:
             node_features = lay(node_attr,node_features,  edge_src, edge_dst, edge_attr, edge_scalars,edge_length,fpit)
         return node_features
+
+
+class EquivariantNoAttention(torch.nn.Module):
+    def __init__(self, irreps_node_input, irreps_node_output) -> None:
+        super().__init__()
+        self.irreps_node_input = o3.Irreps(irreps_node_input)
+        self.irreps_node_output = o3.Irreps(irreps_node_output)
+        self.output_slices: List[Tuple[int, int]] = []
+        start = 0
+        scalar_dim = 0
+        for mul, ir in self.irreps_node_output:
+            end = start + mul * ir.dim
+            if ir.l == 0 and ir.p == 1:
+                self.output_slices.append((start, end))
+                scalar_dim += mul * ir.dim
+            start = end
+        self.scalar_dim = scalar_dim
+        if self.scalar_dim == 0:
+            raise ValueError("use_attention=False requires irreps_out to contain at least one 0e scalar field.")
+        self.lin = torch.nn.Linear(self.irreps_node_input.dim, self.scalar_dim)
+
+    def forward(self,node_attr, node_features, edge_src, edge_dst, edge_attr, edge_scalars,edge_length) -> torch.Tensor:
+        out = node_features.new_zeros((node_features.shape[0], self.irreps_node_output.dim))
+        scalar_features = self.lin(node_features)
+        offset = 0
+        for start, end in self.output_slices:
+            width = end - start
+            out[:, start:end] = scalar_features[:, offset:offset + width]
+            offset += width
+        return out
+
+
+class GlobalDescriptorGate(torch.nn.Module):
+    def __init__(self, global_descriptor_dim, irreps) -> None:
+        super().__init__()
+        self.irreps = o3.Irreps(irreps)
+        gate_indices = []
+        gate_idx = 0
+        for mul, ir in self.irreps:
+            for _ in range(mul):
+                gate_indices.extend([gate_idx] * ir.dim)
+                gate_idx += 1
+        self.register_buffer("gate_indices", torch.tensor(gate_indices, dtype=torch.long))
+        hidden_dim = max(16, min(128, int(global_descriptor_dim) * 2))
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(int(global_descriptor_dim), hidden_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden_dim, self.irreps.num_irreps),
+        )
+
+    def forward(self, node_outputs, global_attr):
+        gates = torch.sigmoid(self.net(global_attr))
+        channel_gates = gates.index_select(1, self.gate_indices)
+        return node_outputs * (1.0 + channel_gates)
 
 
 @compile_mode('script')
@@ -662,6 +735,9 @@ class Network(torch.nn.Module):
         lmax=lmax,
         pool_nodes=True,
         global_descriptor_dim=0,
+        uvu_dropout_p=0.2,
+        use_attention=True,
+        use_global_descriptor_gating=True,
     ) -> None:
         super().__init__()
 
@@ -672,6 +748,8 @@ class Network(torch.nn.Module):
         self.pool_nodes = pool_nodes
         self.formula = formula
         self.global_descriptor_dim = int(global_descriptor_dim or 0)
+        self.use_attention = bool(use_attention)
+        self.use_global_descriptor_gating = bool(use_global_descriptor_gating) and self.global_descriptor_dim > 0
         if self.global_descriptor_dim > 0 and not self.pool_nodes:
             raise ValueError("Global descriptors require pool_nodes=True.")
 
@@ -687,20 +765,34 @@ class Network(torch.nn.Module):
         # self.dropout0 = nn.Dropout(irreps="{}x0e".format(self.embeding_dim),p=0.2)
 
         self.lin=o3.Linear(self.irreps_in,"{}x0e".format(self.embeding_dim))
-        self.GAT=EquivariantAttention(
-            node_attr=self.irreps_in,
-        irreps_node_input="{}x0e".format(self.embeding_dim),
-            irreps_query=irreps_query,
-            irreps_key=irreps_key,
-        irreps_node_hidden=self.irreps_node_hidden,
-        irreps_node_output=irreps_out,
-        irreps_edge_attr=self.irreps_sh,
-        layers=layers,
-        fc_neurons=[self.number_of_basis,100],
-        )
+        if self.use_attention:
+            if int(heads) < 1:
+                raise ValueError("heads must be >= 1 when use_attention=True.")
+            self.GAT=EquivariantAttention(
+                node_attr=self.irreps_in,
+            irreps_node_input="{}x0e".format(self.embeding_dim),
+                irreps_query=irreps_query,
+                irreps_key=irreps_key,
+            irreps_node_hidden=self.irreps_node_hidden,
+            irreps_node_output=irreps_out,
+            irreps_edge_attr=self.irreps_sh,
+            layers=layers,
+            fc_neurons=[self.number_of_basis,100],
+            dropout_p=uvu_dropout_p,
+            )
+        else:
+            self.GAT=EquivariantNoAttention(
+                irreps_node_input="{}x0e".format(self.embeding_dim),
+                irreps_node_output=irreps_out,
+            )
 
         self.irreps_in = self.GAT.irreps_node_input
         self.irreps_out = self.GAT.irreps_node_output
+        self.global_gate = (
+            GlobalDescriptorGate(self.global_descriptor_dim, self.irreps_out)
+            if self.use_global_descriptor_gating
+            else None
+        )
 
         if self.global_descriptor_dim > 0:
             self.global_irreps = o3.Irreps(f"{self.global_descriptor_dim}x0e")
@@ -764,6 +856,8 @@ class Network(torch.nn.Module):
             node_outputs = scatter(node_outputs, batch, dim=0,reduce="mean").div(self.num_nodes ** 0.5)
         else:
             pass
+        if self.global_gate is not None:
+            node_outputs = self.global_gate(node_outputs, global_attr)
         residual_outputs = node_outputs
         if self.global_descriptor_dim > 0:
             node_outputs = torch.cat([node_outputs, global_attr], dim=-1)
@@ -772,6 +866,7 @@ class Network(torch.nn.Module):
         node_outputs2=self.TI1(node_outputs1)
         node_outputs=node_outputs2+residual_outputs
         node_outputs=self.TI(node_outputs)
+        node_outputs=project_tensor_to_inplane(node_outputs)
 
         if torch.isnan(node_outputs).any():
             print('nan after TI')
@@ -783,7 +878,11 @@ class Network(torch.nn.Module):
 
 
 def build_network(feature_dim, num_nodes, config, global_descriptor_dim=0):
-    set_model_hparams(config.get("heads", 2), config.get("lmax", 3))
+    use_attention = config.get("use_attention", True)
+    num_heads = int(config.get("heads", 2))
+    if use_attention and num_heads < 1:
+        raise ValueError("heads must be >= 1 when use_attention=True. Set use_attention=False to disable attention.")
+    set_model_hparams(num_heads if num_heads > 0 else 1, config.get("lmax", 3))
     return Network(
         irreps_in="{}x0e".format(feature_dim),
         embedding_dim=config.get("embedding_dim", 64),
@@ -805,4 +904,7 @@ def build_network(feature_dim, num_nodes, config, global_descriptor_dim=0):
         lmax=config.get("lmax", 3),
         pool_nodes=config.get("pool_nodes", True),
         global_descriptor_dim=global_descriptor_dim,
+        uvu_dropout_p=config.get("uvu_dropout_p", 0.2),
+        use_attention=use_attention,
+        use_global_descriptor_gating=config.get("use_global_descriptor_gating", True),
     )

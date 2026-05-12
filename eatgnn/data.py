@@ -16,7 +16,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder
 from torch_geometric.data import DataLoader
 
-from .target_transform import apply_target_transform, build_target_transform
+from .target_transform import (
+    apply_target_transform,
+    build_target_transform,
+    raw_mask_to_model_mask,
+    raw_tensor_to_model_tensor,
+)
 
 STRUCTURE_FILE_SUFFIXES = {".cif", ".vasp", ".poscar", ".contcar", ".cssr", ".json"}
 STRUCTURE_FILE_NAMES = {"POSCAR", "CONTCAR"}
@@ -202,6 +207,10 @@ def datatransform(crystal, property, features, radial_cutoff, default_dtype, glo
 
     target_tensor = target_tensor.unsqueeze(0)
     target_mask = target_mask.unsqueeze(0)
+    target_tensor_raw = target_tensor.clone()
+    target_mask_raw = target_mask.clone()
+    target_tensor = raw_tensor_to_model_tensor(target_tensor)
+    target_mask = raw_mask_to_model_mask(target_mask)
 
     data_kwargs = {}
     if global_descriptor is not None:
@@ -220,6 +229,8 @@ def datatransform(crystal, property, features, radial_cutoff, default_dtype, glo
         edge_shift=torch.as_tensor(edge_shift, dtype=default_dtype).float(),
         energy=target_tensor,
         energy_mask=target_mask,
+        energy_raw=target_tensor_raw,
+        energy_raw_mask=target_mask_raw,
         **data_kwargs,
     )
     return data
@@ -395,27 +406,22 @@ def _global_descriptor_records_from_json(data):
     raise ValueError("Global descriptor JSON must be a list or a mapping.")
 
 
-def load_global_descriptors(config):
-    path_value = config.get("global_descriptor_path")
-    if not path_value:
-        return {}, 0
-
+def _load_one_global_descriptor_file(path_value, config, descriptor_columns=None):
     path = Path(path_value)
     if not path.exists():
         raise FileNotFoundError(f"Global descriptor path not found: {path}")
 
     uid_key = config.get("global_descriptor_uid_key", "uid")
-    descriptor_columns = config.get("global_descriptor_columns")
     missing_value = float(config.get("global_descriptor_missing_value", 0.0))
 
     if path.suffix.lower() == ".csv":
         frame = pd.read_csv(path)
         if uid_key not in frame.columns:
-            raise ValueError(f"Global descriptor CSV is missing uid column '{uid_key}'.")
+            raise ValueError(f"Global descriptor CSV {path} is missing uid column '{uid_key}'.")
         if descriptor_columns is None:
             descriptor_columns = _global_descriptor_columns(frame, uid_key)
         if not descriptor_columns:
-            raise ValueError("No numeric descriptor columns found in global descriptor CSV.")
+            raise ValueError(f"No numeric descriptor columns found in global descriptor CSV: {path}")
 
         descriptors = {}
         for _, row in frame.iterrows():
@@ -449,6 +455,51 @@ def load_global_descriptors(config):
         return descriptors, (width or 0)
 
     raise ValueError(f"Unsupported global descriptor format: {path.suffix}. Expected .csv or .json.")
+
+
+def load_global_descriptors(config):
+    path_value = config.get("global_descriptor_path")
+    if not path_value:
+        return {}, 0
+
+    paths = path_value if isinstance(path_value, list) else [path_value]
+    descriptor_columns = config.get("global_descriptor_columns")
+    if descriptor_columns is not None and len(paths) > 1:
+        per_file_columns = (
+            isinstance(descriptor_columns, list)
+            and len(descriptor_columns) == len(paths)
+            and all(item is None or isinstance(item, list) for item in descriptor_columns)
+        )
+        if per_file_columns:
+            columns_by_file = descriptor_columns
+        else:
+            columns_by_file = [descriptor_columns] * len(paths)
+    else:
+        columns_by_file = [descriptor_columns] * len(paths)
+
+    loaded = []
+    total_width = 0
+    all_uids = set()
+    for path, columns in zip(paths, columns_by_file):
+        descriptors, width = _load_one_global_descriptor_file(path, config, descriptor_columns=columns)
+        loaded.append((descriptors, width))
+        total_width += width
+        all_uids.update(descriptors)
+
+    if not loaded:
+        return {}, 0
+
+    missing_value = float(config.get("global_descriptor_missing_value", 0.0))
+    merged = {}
+    for uid in all_uids:
+        chunks = []
+        for descriptors, width in loaded:
+            if uid in descriptors:
+                chunks.append(descriptors[uid])
+            else:
+                chunks.append(np.full(width, missing_value, dtype=np.float32))
+        merged[uid] = np.concatenate(chunks).astype(np.float32)
+    return merged, total_width
 
 
 def align_structures_and_labels(structures, labels):

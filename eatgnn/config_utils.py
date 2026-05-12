@@ -22,6 +22,8 @@ DEFAULT_CONFIG = {
     "global_descriptor_uid_key": "uid",
     "global_descriptor_columns": None,
     "global_descriptor_missing_value": 0.0,
+    "use_global_descriptor_in_attention": False,
+    "use_global_descriptor_gating": True,
     "target_transform": {
         "enabled": True,
         "method": "signed_log1p_robust",
@@ -37,6 +39,7 @@ DEFAULT_CONFIG = {
     "test_ratio": 0.1,
     "radial_cutoff": 5,
     "max_radius": 7,
+    "use_attention": True,
     "heads": 2,
     "lmax": 3,
     "embedding_dim": 64,
@@ -49,15 +52,31 @@ DEFAULT_CONFIG = {
     "number_of_basis": 10,
     "pool_nodes": True,
     "lr": 0.005,
+    "weight_decay": 0.01,
+    "gradient_clip_max_norm": 1.0,
+    "uvu_dropout_p": 0.2,
     "lr_scheduler_mode": "min",
     "lr_scheduler_factor": 0.5,
     "lr_scheduler_patience": 8,
     "lr_scheduler_min_lr": 1e-6,
-    "loss_type": "weighted_masked_huber_s_q",
+    "loss_type": "tensor_basis_huber_frobenius",
     "loss_ws": 1.0,
     "loss_wq": None,
+    "loss_component_weights": {
+        "xx": 1.0,
+        "yy": 1.0,
+        "xy": 1.0,
+    },
+    "lambda_tensor": 0.0,
     "huber_delta": None,
     "huber_delta_diag": None,
+    "best_model_metric": "diag_score",
+    "diag_score_weights": {
+        "xx": 0.4,
+        "yy": 0.4,
+        "xy": 0.2,
+    },
+    "diag_score_normalization": "train_mae_scale",
 }
 
 
@@ -72,6 +91,8 @@ def _deep_update(base, updates):
 
 
 def _resolve_path(path_value, base_dir):
+    if isinstance(path_value, list):
+        return [_resolve_path(item, base_dir) for item in path_value]
     path = Path(path_value)
     if path.is_absolute():
         return str(path)
@@ -98,4 +119,6 @@ def load_config(config_path="config.json"):
     config["log_csv_path"] = os.path.join(config["save_dir"], "training_log.csv")
     config["test_predictions_path"] = os.path.join(config["save_dir"], "test_predictions_best.json")
     config["test_metrics_path"] = os.path.join(config["save_dir"], "test_metrics_best.json")
+    config["resolved_config_output_path"] = os.path.join(config["save_dir"], "training_config_resolved.json")
+    config["original_config_output_path"] = os.path.join(config["save_dir"], "training_config_original.json")
     return config
