@@ -13,9 +13,9 @@
   "extra_atom_descriptor_columns": null,
   "extra_atom_descriptor_missing_value": 0.0,
   "global_descriptor_path": [
-  "eatgnn_aux_physical_priors.csv",
-  "stage1_oof_tail_hints.csv"
-   ],
+    "eatgnn_aux_physical_priors.csv",
+    "stage1_oof_tail_hints.csv"
+  ],
   "global_descriptor_uid_key": "uid",
   "global_descriptor_columns": [
     null,
@@ -33,7 +33,7 @@
   "target_transform": {
     "enabled": true,
     "method": "signed_log1p_robust",
-    "eps": 0.000001
+    "eps": 1e-06
   },
   "save_dir": "checkpoints_eatgnn_01",
   "n": null,
@@ -64,8 +64,8 @@
   "lr_scheduler_mode": "min",
   "lr_scheduler_factor": 0.5,
   "lr_scheduler_patience": 2,
-  "lr_scheduler_min_lr": 0.000001,
-  "loss_type": "tensor_basis_huber_frobenius",
+  "lr_scheduler_min_lr": 1e-06,
+  "loss_type": "inplane_irreps_huber_frobenius",
   "loss_component_weights": {
     "xx": 1.0,
     "yy": 1.0,
@@ -79,5 +79,10 @@
     "xy": 1
   },
   "diag_score_normalization": "train_mae_scale",
-  "loss_ws": 1.0
+  "loss_ws": 1.0,
+  "loss_irrep_weights": {
+    "trace": 1.0,
+    "anisotropy": 1.0,
+    "shear": 1.0
+  }
 }

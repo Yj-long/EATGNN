@@ -10,8 +10,10 @@ from tqdm import tqdm
 
 from .data import build_dataloaders
 from .losses import (
+    estimate_inplane_irreps_huber_delta_from_trainset,
     estimate_model_component_huber_delta_from_trainset,
     evaluate_masked_tensor_metrics,
+    inplane_irreps_huber_frobenius_loss,
     tensor_basis_huber_frobenius_loss,
 )
 from .metrics import (
@@ -71,6 +73,30 @@ def save_training_config(config):
             json.dump(original_config, dst, ensure_ascii=False, indent=2)
 
 
+def _loss_uses_irreps(loss_type):
+    return loss_type in {"inplane_irreps_huber", "inplane_irreps_huber_frobenius"}
+
+
+def _loss_component_weights(checkpoint_config):
+    if _loss_uses_irreps(checkpoint_config["loss_type"]):
+        return checkpoint_config.get("loss_irrep_weights") or checkpoint_config["loss_component_weights"]
+    return checkpoint_config["loss_component_weights"]
+
+
+def compute_training_loss(output, batch, checkpoint_config):
+    kwargs = {
+        "component_weights": _loss_component_weights(checkpoint_config),
+        "delta": checkpoint_config["huber_delta"],
+        "lambda_tensor": checkpoint_config["lambda_tensor"],
+    }
+    loss_type = checkpoint_config["loss_type"]
+    if loss_type == "tensor_basis_huber_frobenius":
+        return tensor_basis_huber_frobenius_loss(output, batch.energy, batch.energy_mask, **kwargs)
+    if _loss_uses_irreps(loss_type):
+        return inplane_irreps_huber_frobenius_loss(output, batch.energy, batch.energy_mask, **kwargs)
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+
 def build_checkpoint_config(config):
     return {
         "structure_path": config["structure_path"],
@@ -84,6 +110,7 @@ def build_checkpoint_config(config):
         "supervision": "in_plane_xx_yy_xy",
         "loss_type": config["loss_type"],
         "loss_component_weights": config["loss_component_weights"],
+        "loss_irrep_weights": config.get("loss_irrep_weights"),
         "lambda_tensor": config["lambda_tensor"],
         "huber_delta": config.get("huber_delta"),
         "best_model_metric": config["best_model_metric"],
@@ -155,14 +182,20 @@ def run_training(config):
         checkpoint_config["target_transform"] = target_transform.state_dict()
     checkpoint_config["global_descriptor_dim"] = global_descriptor_dim
     if checkpoint_config["huber_delta"] is None:
-        checkpoint_config["huber_delta"] = estimate_model_component_huber_delta_from_trainset(
-            train_dataloader.dataset
-        )
+        if _loss_uses_irreps(checkpoint_config["loss_type"]):
+            checkpoint_config["huber_delta"] = estimate_inplane_irreps_huber_delta_from_trainset(
+                train_dataloader.dataset
+            )
+        else:
+            checkpoint_config["huber_delta"] = estimate_model_component_huber_delta_from_trainset(
+                train_dataloader.dataset
+            )
     checkpoint_config["diag_score_normalizers"] = estimate_model_basis_diag_normalizers(train_dataloader.dataset)
 
-    print(f"Loss component weights: {checkpoint_config['loss_component_weights']}")
+    print(f"Loss type: {checkpoint_config['loss_type']}")
+    print(f"Loss component weights: {_loss_component_weights(checkpoint_config)}")
     print(f"Tensor Frobenius lambda: {checkpoint_config['lambda_tensor']}")
-    print(f"Huber delta [xx, yy, xy]: {checkpoint_config['huber_delta']}")
+    print(f"Huber delta: {checkpoint_config['huber_delta']}")
     print(f"In-plane score normalizers: {checkpoint_config['diag_score_normalizers']}")
 
     sample_target_shape = tuple(train_dataloader.dataset[0].energy.shape)
@@ -207,14 +240,7 @@ def run_training(config):
 
             with autocast():
                 output = net(batch)
-                loss = tensor_basis_huber_frobenius_loss(
-                    output,
-                    batch.energy,
-                    batch.energy_mask,
-                    component_weights=checkpoint_config["loss_component_weights"],
-                    delta=checkpoint_config["huber_delta"],
-                    lambda_tensor=checkpoint_config["lambda_tensor"],
-                )
+                loss = compute_training_loss(output, batch, checkpoint_config)
 
             if torch.isnan(output).any():
                 print("output is nan")
@@ -254,14 +280,7 @@ def run_training(config):
                 batch = batch.to(device)
                 with autocast():
                     output = net(batch)
-                    loss = tensor_basis_huber_frobenius_loss(
-                        output,
-                        batch.energy,
-                        batch.energy_mask,
-                        component_weights=checkpoint_config["loss_component_weights"],
-                        delta=checkpoint_config["huber_delta"],
-                        lambda_tensor=checkpoint_config["lambda_tensor"],
-                    )
+                    loss = compute_training_loss(output, batch, checkpoint_config)
 
                     batch_mae, batch_rmse, batch_max_abs = evaluate_masked_tensor_metrics(
                         output, batch.energy, batch.energy_mask
@@ -413,14 +432,7 @@ def evaluate_best_checkpoint(net, test_dataloader, device, scaler, checkpoint_co
                 batch = batch.to(device)
                 with autocast():
                     output = net(batch)
-                    loss = tensor_basis_huber_frobenius_loss(
-                        output,
-                        batch.energy,
-                        batch.energy_mask,
-                        component_weights=checkpoint_config["loss_component_weights"],
-                        delta=checkpoint_config["huber_delta"],
-                        lambda_tensor=checkpoint_config["lambda_tensor"],
-                    )
+                    loss = compute_training_loss(output, batch, checkpoint_config)
 
                 batch_mae, batch_rmse, batch_max_abs = evaluate_masked_tensor_metrics(
                     output, batch.energy, batch.energy_mask
